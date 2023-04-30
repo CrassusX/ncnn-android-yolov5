@@ -14,16 +14,31 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="选图" />
+
     <Button
         android:id="@+id/buttonDetect"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="识别-cpu" />
+
     <Button
         android:id="@+id/buttonDetectGPU"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="识别-gpu" />
+
+    <Button
+        android:id="@+id/buttonClassDetectGPU"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="分级识别-gpu" />
+
+    <Button
+        android:id="@+id/buttonClassDetectCPU"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="分级识别-cpu" />
+
     </LinearLayout>
 
     <ImageView

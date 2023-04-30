@@ -32,6 +32,7 @@ public class YoloV5Ncnn
     }
 
     public native Obj[] Detect(Bitmap bitmap, boolean use_gpu);
+    public native Obj[] Class(Bitmap bitmap, boolean use_gpu);
 
     static {
         System.loadLibrary("yolov5ncnn");

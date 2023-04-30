@@ -29,8 +29,10 @@
 static ncnn::UnlockedPoolAllocator g_blob_pool_allocator;
 static ncnn::PoolAllocator g_workspace_pool_allocator;
 
-static ncnn::Net yolov5;
+static ncnn::Net yolov5_detect;
+static ncnn::Net yolov5_class;
 
+//一个自定义的 ncnn 神经网络层,该层实现了将输入数据进行下采样的功能，即将输入矩阵的每个 2x2 的区域压缩成一个元素，并将通道数增加到原来的四倍.
 class YoloV5Focus : public ncnn::Layer
 {
 public:
@@ -89,6 +91,7 @@ struct Object
     float prob;
 };
 
+//计算两个 Object 的交集面积
 static inline float intersection_area(const Object& a, const Object& b)
 {
     if (a.x > b.x + b.w || a.x + a.w < b.x || a.y > b.y + b.h || a.y + a.h < b.y)
@@ -103,6 +106,7 @@ static inline float intersection_area(const Object& a, const Object& b)
     return inter_width * inter_height;
 }
 
+//对一组 Object 按照概率从高到低进行快速排序
 static void qsort_descent_inplace(std::vector<Object>& faceobjects, int left, int right)
 {
     int i = left;
@@ -148,6 +152,8 @@ static void qsort_descent_inplace(std::vector<Object>& faceobjects)
     qsort_descent_inplace(faceobjects, 0, faceobjects.size() - 1);
 }
 
+//非极大值抑制（NMS）函数，用于对一组经过快速排序后的 Object 进行去重处理。该函数接受三个输入参数：faceobjects 表示需要进行 NMS 处理的 Object 序列；picked 是一个空向量，最终将存储保留下来的 Object 的索引；nms_threshold 表示 NMS 算法中的阈值，用于控制去重程度。
+//首先计算了每个 Object 的面积，并遍历所有 Object。对于每个 Object，都和已经选出的 Object 进行比较，计算两者之间的交集和并集面积，得到 IoU（intersection over union）值。如果 IoU 值大于设定的阈值，则认为当前 Object 与已选出的某个 Object 相似度过高，应该予以剔除。否则就将当前 Object 加入 picked 向量中。
 static void nms_sorted_bboxes(const std::vector<Object>& faceobjects, std::vector<int>& picked, float nms_threshold)
 {
     picked.clear();
@@ -187,6 +193,9 @@ static inline float sigmoid(float x)
     return static_cast<float>(1.f / (1.f + exp(-x)));
 }
 
+//生成候选框（proposals）
+//五个输入参数：anchors 表示锚点框的大小和位置，stride 表示特征图和原图之间的缩放比例，in_pad 表示对原图进行 padding 后的图像矩阵，feat_blob 表示经过网络后生成的特征图，prob_threshold 表示筛选 proposals 的置信度阈值，objects 是用于存储生成的 Object 结构体的向量。
+//将该预测框转化为 Object 结构体，并将其加入 objects 向量中
 static void generate_proposals(const ncnn::Mat& anchors, int stride, const ncnn::Mat& in_pad, const ncnn::Mat& feat_blob, float prob_threshold, std::vector<Object>& objects)
 {
     const int num_grid = feat_blob.h;
@@ -288,6 +297,7 @@ static jfieldID hId;
 static jfieldID labelId;
 static jfieldID probId;
 
+//加载和卸载 JNI 库时创建和销毁 GPU 实例
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "JNI_OnLoad");
@@ -320,14 +330,18 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* e
 
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
 
-    yolov5.opt = opt;
 
-    yolov5.register_custom_layer("YoloV5Focus", YoloV5Focus_layer_creator);
+    yolov5_detect.opt = opt;
+    yolov5_class.opt = opt;
+
+    yolov5_detect.register_custom_layer("YoloV5Focus", YoloV5Focus_layer_creator);
+    yolov5_class.register_custom_layer("YoloV5Focus", YoloV5Focus_layer_creator);
 
     // init param
     {
-        int ret = yolov5.load_param(mgr, "yolov5s.param");
-        if (ret != 0)
+        int detect_model = yolov5_detect.load_param(mgr, "detect_sim.param");
+        int class_model = yolov5_class.load_param(mgr, "class_cpu-sim.param");
+        if ((detect_model != 0) & (class_model != 0))
         {
             __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_param failed");
             return JNI_FALSE;
@@ -336,10 +350,11 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* e
 
     // init bin
     {
-        int ret = yolov5.load_model(mgr, "yolov5s.bin");
-        if (ret != 0)
+        int detect_model = yolov5_detect.load_model(mgr, "detect_sim.bin");
+        int class_model = yolov5_class.load_model(mgr, "class_cpu-sim.bin");
+        if ((detect_model != 0) & (class_model != 0))
         {
-            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_model failed");
+            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_bin2e failed");
             return JNI_FALSE;
         }
     }
@@ -410,13 +425,13 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
     // yolov5
     std::vector<Object> objects;
     {
-        const float prob_threshold = 0.25f;
-        const float nms_threshold = 0.45f;
+        const float prob_threshold = 0.64f;
+        const float nms_threshold = 0.4f;
 
         const float norm_vals[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
         in_pad.substract_mean_normalize(0, norm_vals);
 
-        ncnn::Extractor ex = yolov5.create_extractor();
+        ncnn::Extractor ex = yolov5_detect.create_extractor();
 
         ex.set_vulkan_compute(use_gpu);
 
@@ -448,7 +463,7 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
         // stride 16
         {
             ncnn::Mat out;
-            ex.extract("781", out);
+            ex.extract("375", out);
 
             ncnn::Mat anchors(6);
             anchors[0] = 30.f;
@@ -467,7 +482,7 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
         // stride 32
         {
             ncnn::Mat out;
-            ex.extract("801", out);
+            ex.extract("400", out);
 
             ncnn::Mat anchors(6);
             anchors[0] = 116.f;
@@ -518,15 +533,7 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
 
     // objects to Obj[]
     static const char* class_names[] = {
-        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-        "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
-        "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-        "hair drier", "toothbrush"
+       "benign","malignant"
     };
 
     jobjectArray jObjArray = env->NewObjectArray(objects.size(), objCls, NULL);
@@ -551,4 +558,185 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
     return jObjArray;
 }
 
+JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Class(JNIEnv* env, jobject thiz, jobject bitmap, jboolean use_gpu)
+{
+    if (use_gpu == JNI_TRUE && ncnn::get_gpu_count() == 0)
+    {
+        return NULL;
+        //return env->NewStringUTF("no vulkan capable gpu");
+    }
+
+    double start_time = ncnn::get_current_time();
+
+    AndroidBitmapInfo info;
+    AndroidBitmap_getInfo(env, bitmap, &info);
+    const int width = info.width;
+    const int height = info.height;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888)
+        return NULL;
+
+    // ncnn from bitmap
+    const int target_size = 640;
+
+    // letterbox pad to multiple of 32
+    int w = width;
+    int h = height;
+    float scale = 1.f;
+    if (w > h)
+    {
+        scale = (float)target_size / w;
+        w = target_size;
+        h = h * scale;
+    }
+    else
+    {
+        scale = (float)target_size / h;
+        h = target_size;
+        w = w * scale;
+    }
+
+    ncnn::Mat in = ncnn::Mat::from_android_bitmap_resize(env, bitmap, ncnn::Mat::PIXEL_RGB, w, h);
+
+    // pad to target_size rectangle
+    // yolov5/utils/datasets.py letterbox
+    int wpad = (w + 31) / 32 * 32 - w;
+    int hpad = (h + 31) / 32 * 32 - h;
+    ncnn::Mat in_pad;
+    ncnn::copy_make_border(in, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, ncnn::BORDER_CONSTANT, 114.f);
+
+    // yolov5
+    std::vector<Object> objects;
+    {
+        const float prob_threshold = 0.4f;
+        const float nms_threshold = 0.2f;
+
+        const float norm_vals[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
+        in_pad.substract_mean_normalize(0, norm_vals);
+
+        ncnn::Extractor ex = yolov5_class.create_extractor();
+
+        ex.set_vulkan_compute(use_gpu);
+
+        ex.input("images", in_pad);
+
+        std::vector<Object> proposals;
+
+        // anchor setting from yolov5/models/yolov5s.yaml
+
+        // stride 8
+        {
+            ncnn::Mat out;
+            ex.extract("output", out);
+
+            ncnn::Mat anchors(6);
+            anchors[0] = 10.f;
+            anchors[1] = 13.f;
+            anchors[2] = 16.f;
+            anchors[3] = 30.f;
+            anchors[4] = 33.f;
+            anchors[5] = 23.f;
+
+            std::vector<Object> objects8;
+            generate_proposals(anchors, 8, in_pad, out, prob_threshold, objects8);
+
+            proposals.insert(proposals.end(), objects8.begin(), objects8.end());
+        }
+
+        // stride 16
+        {
+            ncnn::Mat out;
+            ex.extract("375", out);
+
+            ncnn::Mat anchors(6);
+            anchors[0] = 30.f;
+            anchors[1] = 61.f;
+            anchors[2] = 62.f;
+            anchors[3] = 45.f;
+            anchors[4] = 59.f;
+            anchors[5] = 119.f;
+
+            std::vector<Object> objects16;
+            generate_proposals(anchors, 16, in_pad, out, prob_threshold, objects16);
+
+            proposals.insert(proposals.end(), objects16.begin(), objects16.end());
+        }
+
+        // stride 32
+        {
+            ncnn::Mat out;
+            ex.extract("400", out);
+
+            ncnn::Mat anchors(6);
+            anchors[0] = 116.f;
+            anchors[1] = 90.f;
+            anchors[2] = 156.f;
+            anchors[3] = 198.f;
+            anchors[4] = 373.f;
+            anchors[5] = 326.f;
+
+            std::vector<Object> objects32;
+            generate_proposals(anchors, 32, in_pad, out, prob_threshold, objects32);
+
+            proposals.insert(proposals.end(), objects32.begin(), objects32.end());
+        }
+
+        // sort all proposals by score from highest to lowest
+        qsort_descent_inplace(proposals);
+
+        // apply nms with nms_threshold
+        std::vector<int> picked;
+        nms_sorted_bboxes(proposals, picked, nms_threshold);
+
+        int count = picked.size();
+
+        objects.resize(count);
+        for (int i = 0; i < count; i++)
+        {
+            objects[i] = proposals[picked[i]];
+
+            // adjust offset to original unpadded
+            float x0 = (objects[i].x - (wpad / 2)) / scale;
+            float y0 = (objects[i].y - (hpad / 2)) / scale;
+            float x1 = (objects[i].x + objects[i].w - (wpad / 2)) / scale;
+            float y1 = (objects[i].y + objects[i].h - (hpad / 2)) / scale;
+
+            // clip
+            x0 = std::max(std::min(x0, (float)(width - 1)), 0.f);
+            y0 = std::max(std::min(y0, (float)(height - 1)), 0.f);
+            x1 = std::max(std::min(x1, (float)(width - 1)), 0.f);
+            y1 = std::max(std::min(y1, (float)(height - 1)), 0.f);
+
+            objects[i].x = x0;
+            objects[i].y = y0;
+            objects[i].w = x1 - x0;
+            objects[i].h = y1 - y0;
+        }
+    }
+
+    // objects to Obj[]
+    static const char* class_names[] = {
+            "BIRADS-1","BIRADS-2","BIRADS-3","BIRADS-4"
+    };
+
+    jobjectArray jObjArray = env->NewObjectArray(objects.size(), objCls, NULL);
+
+    for (size_t i=0; i<objects.size(); i++)
+    {
+        jobject jObj = env->NewObject(objCls, constructortorId, thiz);
+
+        env->SetFloatField(jObj, xId, objects[i].x);
+        env->SetFloatField(jObj, yId, objects[i].y);
+        env->SetFloatField(jObj, wId, objects[i].w);
+        env->SetFloatField(jObj, hId, objects[i].h);
+        env->SetObjectField(jObj, labelId, env->NewStringUTF(class_names[objects[i].label]));
+        env->SetFloatField(jObj, probId, objects[i].prob);
+
+        env->SetObjectArrayElement(jObjArray, i, jObj);
+    }
+
+    double elasped = ncnn::get_current_time() - start_time;
+    __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "%.2fms   detect", elasped);
+
+    return jObjArray;
+}
 }
